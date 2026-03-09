@@ -98,7 +98,10 @@ def main(config: DictConfig):
 
     if config.train:
         # Check if a past checkpoint exists to resume training from
-        checkpoint_dir = Path.cwd().joinpath("checkpoints")
+        # checkpoint_dir = Path.cwd().joinpath("checkpoints")
+        
+        from hydra.core.hydra_config import HydraConfig
+        checkpoint_dir = Path(HydraConfig.get().runtime.output_dir).joinpath("checkpoints")
         resume_from_checkpoint = utils.get_last_checkpoint(checkpoint_dir)
         if resume_from_checkpoint is not None:
             log.info(f"Resuming training from checkpoint {resume_from_checkpoint}")

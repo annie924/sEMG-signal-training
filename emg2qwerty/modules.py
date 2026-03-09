@@ -9,6 +9,8 @@ from collections.abc import Sequence
 import torch
 from torch import nn
 
+import math
+
 
 class SpectrogramNorm(nn.Module):
     """A `torch.nn.Module` that applies 2D batch normalization over spectrogram
@@ -278,3 +280,175 @@ class TDSConvEncoder(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.tds_conv_blocks(inputs)  # (T, N, num_features)
+
+    
+# New Transformer
+class PositionalEncoding(nn.Module):
+    """
+    Args:
+        d_model (int): Feature dimension (must match num_features).
+        dropout (float): Dropout probability. (default: 0.1)
+        max_len (int): Maximum sequence length supported. (default: 200000)
+    """
+
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 200000) -> None:
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)  # (max_len, 1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)
+        )  # (d_model/2,)
+
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (T, N, d_model)
+        x = x + self.pe[: x.size(0)]
+        return self.dropout(x)
+
+
+class TransformerEncoder(nn.Module):
+    """Positional encoding followed by N stacked TransformerEncoderLayers
+    with pre-norm (norm_first=True).
+
+    Args:
+        num_features (int): Input/output feature dimension (d_model).
+        num_heads (int): Number of attention heads. Must divide num_features.
+        num_layers (int): Number of stacked encoder layers.
+        dim_feedforward (int): Hidden size of the FFN inside each layer.
+        dropout (float): Dropout applied to attention weights and FFN.
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        num_heads: int = 4,
+        num_layers: int = 4,
+        dim_feedforward: int = 512,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+
+        self.pos_enc = PositionalEncoding(num_features, dropout=dropout)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=num_features,
+            nhead=num_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=False,  # expects (T, N, d_model)
+            norm_first=True,    # pre-norm stabilises training
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        # inputs: (T, N, num_features)
+        x = self.pos_enc(inputs)
+        return self.transformer(x)  # (T, N, num_features)
+    
+
+# LSTM
+class LSTMEncoder(nn.Module):
+    """A bidirectional LSTM encoder for EMG sequence modeling.
+    
+    Args:
+        num_features (int): Input feature size (T, N, num_features).
+        hidden_size (int): Hidden size of each LSTM direction.
+            Output size will be hidden_size * 2 due to bidirectional.
+            Set hidden_size = num_features // 2 to keep output size
+            equal to num_features.
+        num_layers (int): Number of stacked LSTM layers.
+        dropout (float): Dropout probability between LSTM layers.
+            Only applied when num_layers > 1.
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        hidden_size: int,
+        num_layers: int = 3,
+        dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+
+        self.lstm = nn.LSTM(
+            input_size=num_features,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=False,   # 保持TNC格式，time-first
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+
+        self.projection = nn.Linear(hidden_size * 2, num_features)
+        self.layer_norm = nn.LayerNorm(num_features)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        # inputs: (T, N, num_features)
+        x, _ = self.lstm(inputs)           # (T, N, hidden_size*2)
+        x = self.projection(x)             # (T, N, num_features)
+        x = x + inputs                     # skip connection
+        return self.layer_norm(x)          # (T, N, num_features)
+
+
+class CNNLSTMEncoder(nn.Module):
+    """A hybrid CNN + BiLSTM encoder.
+    CNN (TDSConv blocks) first extracts local temporal features,
+    then BiLSTM captures long-range sequential dependencies.
+
+    Args:
+        num_features (int): Input feature size (T, N, num_features).
+        block_channels (list): Number of channels per TDSConv2dBlock.
+            Fewer blocks than baseline recommended since LSTM handles
+            long-range dependencies.
+        kernel_width (int): Kernel size of the temporal convolutions in CNN.
+        hidden_size (int): Hidden size of each LSTM direction.
+            Set hidden_size = num_features // 2 to keep output size
+            equal to num_features.
+        num_layers (int): Number of stacked LSTM layers.
+        dropout (float): Dropout probability between LSTM layers.
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        block_channels: Sequence[int],
+        kernel_width: int,
+        hidden_size: int,
+        num_layers: int = 2,
+        dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+
+        self.cnn = TDSConvEncoder(
+            num_features=num_features,
+            block_channels=block_channels,
+            kernel_width=kernel_width,
+        )
+
+        self.lstm = nn.LSTM(
+            input_size=num_features,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=False,  
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+
+        self.projection = nn.Linear(hidden_size * 2, num_features)
+        self.layer_norm = nn.LayerNorm(num_features)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        # inputs: (T, N, num_features)
+        x = self.cnn(inputs)      
+        residual = x
+        x, _ = self.lstm(x)        # (T', N, hidden_size*2)
+        x = self.projection(x)     # (T', N, num_features)
+        x = x + residual           # skip connection
+        return self.layer_norm(x)  # (T', N, num_features)

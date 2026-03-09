@@ -27,11 +27,25 @@ def instantiate_optimizer_and_scheduler(
     }
 
 
+import torch
+
 def get_last_checkpoint(checkpoint_dir: Path) -> Path | None:
     checkpoints = list(checkpoint_dir.glob("*.ckpt"))
     if not checkpoints:
         return None
-    return max(checkpoints, key=lambda p: p.stat().st_mtime)
+    def get_epoch(p):
+        try:
+            ckpt = torch.load(p, map_location="cpu")
+            return ckpt.get("epoch", -1)
+        except Exception:
+            return -1
+    return max(checkpoints, key=get_epoch)
+
+# def get_last_checkpoint(checkpoint_dir: Path) -> Path | None:
+#     checkpoints = list(checkpoint_dir.glob("*.ckpt"))
+#     if not checkpoints:
+#         return None
+#     return max(checkpoints, key=lambda p: p.stat().st_mtime)
 
 
 def cpus_per_task(gpus_per_node: int, tasks_per_node: int, num_workers: int) -> int:

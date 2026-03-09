@@ -1,0 +1,28 @@
+# @package _global_
+# CNN front-end (TDSConv) + Transformer encoder
+
+module:
+  _target_: emg2qwerty.lightning.TDSConvTransformerCTCModule
+
+  # ── CNN front-end ──────────────────────────────────────────────────────────
+  # Keep identical to baseline (tds_conv_ctc.yaml) for fair comparison.
+  in_features: 528          # freq * channels = (n_fft // 2 + 1) * 16 = 33 * 16
+  mlp_features: [384]
+  block_channels: [24, 24, 24, 24]
+  kernel_width: 32
+
+  # ── Transformer encoder ────────────────────────────────────────────────────
+  # Reduced from 21.1M → ~7M params to match baseline scale (~5.2M)
+  # and fix overfitting (val=16.7% vs test=45%) + high IER (31%)
+  #
+  # num_features = NUM_BANDS * mlp_features[-1] = 2 * 384 = 768
+  # num_heads must divide num_features: 768 / 4 = 192  ✓
+  num_heads: 4              # was 8
+  num_transformer_layers: 2 # was 4  (main param reduction)
+  dim_feedforward: 512      # was 1024
+  transformer_dropout: 0.2  
+
+datamodule:
+  _target_: emg2qwerty.lightning.WindowedEMGDataModule
+  window_length: 8000       # 4 sec windows for 2kHz EMG
+  padding: [1800, 200]      # 900ms past context, 100ms future context
